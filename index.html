@@ -46,6 +46,16 @@
       min-height: 60vh;
       display: block;
     }
+
+    /* ВАЖНО: НЕ display:none — иначе на Android Chrome могут не идти кадры */
+    #video {
+      position: fixed;
+      left: -10000px;
+      top: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+    }
   </style>
 
   <!-- MediaPipe -->
@@ -63,7 +73,8 @@
 
 <div id="status">Статус: ожидаю запуск…</div>
 
-<video id="video" playsinline style="display:none"></video>
+<!-- НЕ скрываем display:none -->
+<video id="video" playsinline muted></video>
 <canvas id="canvas"></canvas>
 
 <script>
@@ -91,10 +102,13 @@ hands.setOptions({
 });
 
 hands.onResults(results => {
-  if (!results.image) return;
+  if (!results || !results.image) return;
 
+  // Размер canvas под реальный кадр
   canvas.width = results.image.width;
   canvas.height = results.image.height;
+
+  // Рисуем кадр
   ctx.drawImage(results.image, 0, 0);
 
   let fingers = 0;
@@ -102,17 +116,17 @@ hands.onResults(results => {
   if (results.multiHandLandmarks && results.multiHandLandmarks.length) {
     const lm = results.multiHandLandmarks[0];
 
-    // Большой палец
+    // Большой палец (для selfieMode обычно ок так)
     if (lm[4].x > lm[3].x) fingers++;
 
     // Остальные пальцы
-    if (lm[8].y < lm[6].y) fingers++;
+    if (lm[8].y  < lm[6].y)  fingers++;
     if (lm[12].y < lm[10].y) fingers++;
     if (lm[16].y < lm[14].y) fingers++;
     if (lm[20].y < lm[18].y) fingers++;
 
-    drawConnectors(ctx, lm, HAND_CONNECTIONS, { color: '#00ff99', lineWidth: 4 });
-    drawLandmarks(ctx, lm, { color: '#ffffff', radius: 3 });
+    drawConnectors(ctx, lm, HAND_CONNECTIONS, { lineWidth: 4 });
+    drawLandmarks(ctx, lm, { radius: 3 });
   }
 
   countEl.textContent = fingers;
@@ -133,13 +147,17 @@ btn.onclick = async () => {
     });
 
     await camera.start();
+
+    // Ключевое для Android Chrome: явно проиграть video
+    await video.play();
+
     running = true;
     btn.textContent = 'Камера работает';
     setStatus('камера запущена, ищу руку…');
   } catch (e) {
     console.error(e);
-    setStatus('ОШИБКА: нет доступа к камере');
-    alert('Не удалось запустить камеру.\n\nПроверь:\n1) сайт открыт по HTTPS\n2) разрешение камеры (замочек в адресной строке)');
+    setStatus('ОШИБКА: нет кадров/нет доступа');
+    alert('Не удалось получить видео-кадры.\nПроверь разрешение камеры и открой сайт по HTTPS.');
   }
 };
 </script>
