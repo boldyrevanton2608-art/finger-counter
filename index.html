@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Счётчик пальцев</title>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: #0b0f17;
+      color: #e7eefc;
+    }
+    header {
+      padding: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    button {
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px solid #2b3f63;
+      background: #1b2a44;
+      color: white;
+      font-weight: 600;
+    }
+    canvas {
+      width: 100%;
+      max-width: 900px;
+      display: block;
+      margin: 0 auto;
+      border-radius: 16px;
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+
+<body>
+
+<header>
+  <div>Пальцев: <b id="count">—</b></div>
+  <button id="btn">Запустить камеру</button>
+</header>
+
+<video id="video" playsinline style="display:none"></video>
+<canvas id="canvas"></canvas>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const countEl = document.getElementById('count');
+const btn = document.getElementById('btn');
+
+let running = false;
+let camera = null;
+
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+
+hands.setOptions({
+  maxNumHands: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.7,
+  selfieMode: true
+});
+
+hands.onResults(results => {
+  canvas.width = results.image.width;
+  canvas.height = results.image.height;
+  ctx.drawImage(results.image, 0, 0);
+
+  let fingers = 0;
+
+  if (results.multiHandLandmarks) {
+    const lm = results.multiHandLandmarks[0];
+
+    // thumb
+    if (lm[4].x > lm[3].x) fingers++;
+
+    // other fingers
+    if (lm[8].y < lm[6].y) fingers++;
+    if (lm[12].y < lm[10].y) fingers++;
+    if (lm[16].y < lm[14].y) fingers++;
+    if (lm[20].y < lm[18].y) fingers++;
+
+    drawConnectors(ctx, lm, HAND_CONNECTIONS);
+    drawLandmarks(ctx, lm);
+  }
+
+  countEl.textContent = fingers;
+});
+
+btn.onclick = async () => {
+  if (running) return;
+
+  camera = new Camera(video, {
+    onFrame: async () => {
+      await hands.send({ image: video });
+    },
+    width: 1280,
+    height: 720
+  });
+
+  await camera.start();
+  running = true;
+  btn.textContent = 'Камера работает';
+};
+</script>
+
+</body>
+</html>
