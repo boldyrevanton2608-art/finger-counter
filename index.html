@@ -12,11 +12,9 @@
     .pill { padding:8px 10px; border-radius:999px; border:1px solid #2b3f63; background:#132038; font-weight:700; }
     #status { padding: 0 14px 12px; opacity:.9; font-size:14px; }
     canvas { width: calc(100% - 28px); margin: 0 14px 14px; border-radius:16px; border:1px solid #2b3f63; background:#05070c; min-height:60vh; display:block; }
-    /* Важно: video НЕ display:none (иначе иногда нет кадров) */
     #video { position: fixed; left:-10000px; top:0; width: 1px; height: 1px; opacity:0; }
   </style>
 
-  <!-- MediaPipe Hands -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
 </head>
@@ -49,6 +47,7 @@ let running = false;
 let stream = null;
 let frames = 0;
 let lastResultAt = 0;
+let lastHandSeenAt = 0;
 
 const hands = new Hands({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
@@ -62,53 +61,94 @@ hands.setOptions({
   selfieMode: true
 });
 
+function countFingers(landmarks, handednessLabel, selfieMode=true) {
+  // landmark: {x,y,z} normalized [0..1]
+  // Индексы: 4,8,12,16,20 - кончики; 3 - сустав большого; 6,10,14,18 - PIP остальных
+  let fingers = 0;
+
+  const thumbTip = landmarks[4];
+  const thumbIp  = landmarks[3];
+
+  // Большой палец по X с учётом Left/Right и зеркала
+  // handednessLabel: 'Left'/'Right' (это «рука человека», а не отражение)
+  if (selfieMode) {
+    // При зеркале направления меняются
+    if (handednessLabel === 'Right') {
+      if (thumbTip.x > thumbIp.x) fingers++;
+    } else {
+      if (thumbTip.x < thumbIp.x) fingers++;
+    }
+  } else {
+    if (handednessLabel === 'Right') {
+      if (thumbTip.x < thumbIp.x) fingers++;
+    } else {
+      if (thumbTip.x > thumbIp.x) fingers++;
+    }
+  }
+
+  // Остальные пальцы: tip выше pip (y меньше)
+  if (landmarks[8].y  < landmarks[6].y)  fingers++;
+  if (landmarks[12].y < landmarks[10].y) fingers++;
+  if (landmarks[16].y < landmarks[14].y) fingers++;
+  if (landmarks[20].y < landmarks[18].y) fingers++;
+
+  return fingers;
+}
+
 hands.onResults((results) => {
   lastResultAt = Date.now();
 
   if (!results || !results.image) return;
 
-  // подгоняем canvas под размер кадра
+  // canvas под кадр
   canvas.width = results.image.width;
   canvas.height = results.image.height;
 
-  // рисуем кадр
+  // рисуем видео-кадр
   ctx.drawImage(results.image, 0, 0);
 
-  let fingers = 0;
+  let fingersText = '0';
+  let status = 'ищу руку…';
 
   if (results.multiHandLandmarks && results.multiHandLandmarks.length) {
+    lastHandSeenAt = Date.now();
+
     const lm = results.multiHandLandmarks[0];
+    const handed = (results.multiHandedness && results.multiHandedness[0] && results.multiHandedness[0].label) || 'Right';
 
-    // большой палец (selfieMode)
-    if (lm[4].x > lm[3].x) fingers++;
+    const fingers = countFingers(lm, handed, true);
+    fingersText = String(fingers);
 
-    // остальные пальцы
-    if (lm[8].y  < lm[6].y)  fingers++;
-    if (lm[12].y < lm[10].y) fingers++;
-    if (lm[16].y < lm[14].y) fingers++;
-    if (lm[20].y < lm[18].y) fingers++;
-
+    // рисуем скелет (чтобы было видно, что рука реально детектится)
     drawConnectors(ctx, lm, HAND_CONNECTIONS, { lineWidth: 4 });
     drawLandmarks(ctx, lm, { radius: 3 });
+
+    status = `рука найдена (${handed})`;
+  } else {
+    // если руки нет — показываем "—"
+    fingersText = '—';
   }
 
-  countEl.textContent = String(fingers);
+  countEl.textContent = fingersText;
+
+  // статус с небольшим watchdog
+  if (Date.now() - lastHandSeenAt > 2000) {
+    setStatus('рука не найдена (приблизи ладонь, больше света, рука целиком в кадре)');
+  } else {
+    setStatus(status);
+  }
 });
 
 async function startCamera() {
   setStatus('запрашиваю доступ к камере…');
 
-  // На Android чаще всего норм работает facingMode: 'user'
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false
   });
 
   video.srcObject = stream;
-
-  // Важно дождаться, когда видео реально начнёт отдавать кадры
   await video.play();
-
   setStatus('камера даёт кадры, запускаю распознавание…');
 }
 
@@ -118,28 +158,16 @@ async function loop() {
   frames++;
   framesEl.textContent = String(frames);
 
-  // Иногда полезно “пнуть” canvas даже до результатов, чтобы понимать что видео живое
-  if (video.videoWidth && video.videoHeight) {
-    // если ещё не задан размер canvas — зададим по видео
-    if (!canvas.width || !canvas.height) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-    }
-    // рисуем сырое видео как “диагностику”
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  // Если по какой-то причине результаты не приходят — покажем подсказку
+  if (Date.now() - lastResultAt > 3000) {
+    setStatus('нет ответа от модели… (обнови страницу и попробуй ещё раз)');
   }
 
-  // отправляем кадр в MediaPipe
   try {
     await hands.send({ image: video });
   } catch (e) {
     console.error(e);
-    setStatus('ОШИБКА MediaPipe: не удалось обработать кадр (см. консоль)');
-  }
-
-  // watchdog: если результатов нет долго — покажем подсказку
-  if (Date.now() - lastResultAt > 3000) {
-    setStatus('видео есть, но результатов от модели нет… (пробую дальше)');
+    setStatus('ошибка обработки кадра (см. консоль)');
   }
 
   requestAnimationFrame(loop);
@@ -171,13 +199,14 @@ btn.addEventListener('click', async () => {
     btn.textContent = 'Остановить';
     await startCamera();
     lastResultAt = Date.now();
+    lastHandSeenAt = 0;
     requestAnimationFrame(loop);
   } catch (e) {
     console.error(e);
     running = false;
     btn.textContent = 'Запустить камеру';
-    setStatus('ОШИБКА запуска камеры: проверь разрешение/HTTPS');
-    alert('Не удалось запустить камеру. Проверь разрешение камеры для сайта (иконка замка) и что сайт открыт по HTTPS.');
+    setStatus('ошибка запуска камеры: проверь разрешение/HTTPS');
+    alert('Не удалось запустить камеру. Проверь разрешение камеры для сайта и что открыто по HTTPS.');
   }
 });
 </script>
