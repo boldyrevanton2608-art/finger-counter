@@ -3,213 +3,318 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Счётчик пальцев</title>
+  <title>Замер ковра по A4</title>
 
   <style>
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b0f17; color:#e7eefc; }
-    header { padding:14px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
+    header { padding:14px; display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
     button { padding:10px 14px; border-radius:12px; border:1px solid #2b3f63; background:#1b2a44; color:#fff; font-weight:700; }
     .pill { padding:8px 10px; border-radius:999px; border:1px solid #2b3f63; background:#132038; font-weight:700; }
-    #status { padding: 0 14px 12px; opacity:.9; font-size:14px; }
+    #status { padding: 0 14px 12px; opacity:.9; font-size:14px; line-height:1.35; }
     canvas { width: calc(100% - 28px); margin: 0 14px 14px; border-radius:16px; border:1px solid #2b3f63; background:#05070c; min-height:60vh; display:block; }
     #video { position: fixed; left:-10000px; top:0; width: 1px; height: 1px; opacity:0; }
+    .hint { padding:0 14px 14px; opacity:.75; font-size:12px; }
   </style>
 
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <!-- OpenCV.js (компьютерное зрение в браузере) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 
 <body>
-
 <header>
-  <div class="pill">Пальцев: <span id="count">—</span></div>
-  <div class="pill">Кадры: <span id="frames">0</span></div>
-  <button id="btn">Запустить камеру</button>
+  <div class="pill">A4: <span id="a4">—</span></div>
+  <div class="pill">Ковёр: <span id="rug">—</span></div>
+  <button id="btn">Старт</button>
 </header>
 
-<div id="status">Статус: ожидаю запуск…</div>
+<div id="status">Статус: жду OpenCV…</div>
 
 <video id="video" playsinline muted></video>
 <canvas id="canvas"></canvas>
+<div class="hint">
+  Условия: A4 и ковёр должны быть целиком в кадре, лежать на одной плоскости, света должно быть достаточно.
+  Если ковёр похож по цвету на пол — алгоритму сложно.
+</div>
 
 <script>
+const A4_W_MM = 210;
+const A4_H_MM = 297;
+const A4_RATIO = A4_H_MM / A4_W_MM; // ~1.414
+
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+
 const btn = document.getElementById('btn');
-const countEl = document.getElementById('count');
-const framesEl = document.getElementById('frames');
 const statusEl = document.getElementById('status');
+const a4El = document.getElementById('a4');
+const rugEl = document.getElementById('rug');
 
 const setStatus = (t) => statusEl.textContent = 'Статус: ' + t;
 
 let running = false;
 let stream = null;
-let frames = 0;
-let lastResultAt = 0;
-let lastHandSeenAt = 0;
+let timer = null;
 
-const hands = new Hands({
-  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-});
+// ---- helpers ----
+function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
 
-hands.setOptions({
-  maxNumHands: 1,
-  modelComplexity: 1,
-  minDetectionConfidence: 0.7,
-  minTrackingConfidence: 0.7,
-  selfieMode: true
-});
-
-function countFingers(landmarks, handednessLabel, selfieMode=true) {
-  // landmark: {x,y,z} normalized [0..1]
-  // Индексы: 4,8,12,16,20 - кончики; 3 - сустав большого; 6,10,14,18 - PIP остальных
-  let fingers = 0;
-
-  const thumbTip = landmarks[4];
-  const thumbIp  = landmarks[3];
-
-  // Большой палец по X с учётом Left/Right и зеркала
-  // handednessLabel: 'Left'/'Right' (это «рука человека», а не отражение)
-  if (selfieMode) {
-    // При зеркале направления меняются
-    if (handednessLabel === 'Right') {
-      if (thumbTip.x > thumbIp.x) fingers++;
-    } else {
-      if (thumbTip.x < thumbIp.x) fingers++;
-    }
-  } else {
-    if (handednessLabel === 'Right') {
-      if (thumbTip.x < thumbIp.x) fingers++;
-    } else {
-      if (thumbTip.x > thumbIp.x) fingers++;
-    }
-  }
-
-  // Остальные пальцы: tip выше pip (y меньше)
-  if (landmarks[8].y  < landmarks[6].y)  fingers++;
-  if (landmarks[12].y < landmarks[10].y) fingers++;
-  if (landmarks[16].y < landmarks[14].y) fingers++;
-  if (landmarks[20].y < landmarks[18].y) fingers++;
-
-  return fingers;
+function orderQuad(pts) {
+  // pts: array of 4 {x,y}
+  // return [tl,tr,br,bl]
+  const sum = pts.map(p => p.x + p.y);
+  const diff = pts.map(p => p.x - p.y);
+  const tl = pts[sum.indexOf(Math.min(...sum))];
+  const br = pts[sum.indexOf(Math.max(...sum))];
+  const tr = pts[diff.indexOf(Math.max(...diff))];
+  const bl = pts[diff.indexOf(Math.min(...diff))];
+  return [tl,tr,br,bl];
 }
 
-hands.onResults((results) => {
-  lastResultAt = Date.now();
+function quadSideLengths(quad) {
+  const [tl,tr,br,bl] = quad;
+  const top = dist(tl,tr);
+  const right = dist(tr,br);
+  const bottom = dist(br,bl);
+  const left = dist(bl,tl);
+  return { top,right,bottom,left };
+}
 
-  if (!results || !results.image) return;
+function avg(a,b){ return (a+b)/2; }
 
-  // canvas под кадр
-  canvas.width = results.image.width;
-  canvas.height = results.image.height;
+function drawQuad(quad, color='rgba(0,255,153,0.9)', lw=4) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  ctx.moveTo(quad[0].x, quad[0].y);
+  ctx.lineTo(quad[1].x, quad[1].y);
+  ctx.lineTo(quad[2].x, quad[2].y);
+  ctx.lineTo(quad[3].x, quad[3].y);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
 
-  // рисуем видео-кадр
-  ctx.drawImage(results.image, 0, 0);
+function drawLabel(text, x, y) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(x, y-24, 260, 28);
+  ctx.fillStyle = '#e7eefc';
+  ctx.font = '700 16px system-ui,-apple-system,Segoe UI,Roboto,Arial';
+  ctx.fillText(text, x+8, y-6);
+  ctx.restore();
+}
 
-  let fingersText = '0';
-  let status = 'ищу руку…';
+// ---- OpenCV processing ----
+function findQuads(matRGBA) {
+  // returns list of {quad:[{x,y}...], area:number}
+  let mat = new cv.Mat();
+  cv.cvtColor(matRGBA, mat, cv.COLOR_RGBA2GRAY);
 
-  if (results.multiHandLandmarks && results.multiHandLandmarks.length) {
-    lastHandSeenAt = Date.now();
+  // slight blur
+  cv.GaussianBlur(mat, mat, new cv.Size(5,5), 0, 0, cv.BORDER_DEFAULT);
 
-    const lm = results.multiHandLandmarks[0];
-    const handed = (results.multiHandedness && results.multiHandedness[0] && results.multiHandedness[0].label) || 'Right';
+  // edges
+  let edges = new cv.Mat();
+  cv.Canny(mat, edges, 60, 160);
 
-    const fingers = countFingers(lm, handed, true);
-    fingersText = String(fingers);
+  // dilate to close gaps
+  let kernel = cv.Mat.ones(3,3, cv.CV_8U);
+  cv.dilate(edges, edges, kernel);
 
-    // рисуем скелет (чтобы было видно, что рука реально детектится)
-    drawConnectors(ctx, lm, HAND_CONNECTIONS, { lineWidth: 4 });
-    drawLandmarks(ctx, lm, { radius: 3 });
+  // contours
+  let contours = new cv.MatVector();
+  let hierarchy = new cv.Mat();
+  cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    status = `рука найдена (${handed})`;
-  } else {
-    // если руки нет — показываем "—"
-    fingersText = '—';
+  const quads = [];
+
+  for (let i=0; i<contours.size(); i++) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < 3000) { cnt.delete(); continue; } // отсекаем мелочь
+
+    const peri = cv.arcLength(cnt, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+    if (approx.rows === 4 && cv.isContourConvex(approx)) {
+      // extract points
+      const pts = [];
+      for (let r=0; r<4; r++) {
+        const x = approx.intPtr(r,0)[0];
+        const y = approx.intPtr(r,0)[1];
+        pts.push({x,y});
+      }
+      const quad = orderQuad(pts);
+      quads.push({ quad, area });
+    }
+
+    approx.delete();
+    cnt.delete();
   }
 
-  countEl.textContent = fingersText;
+  mat.delete(); edges.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+  return quads;
+}
 
-  // статус с небольшим watchdog
-  if (Date.now() - lastHandSeenAt > 2000) {
-    setStatus('рука не найдена (приблизи ладонь, больше света, рука целиком в кадре)');
-  } else {
-    setStatus(status);
+function pickA4(quads) {
+  // ищем четырёхугольник с соотношением сторон около 1.414 и разумной площадью
+  // чем больше площадь — тем увереннее (но не слишком огромный)
+  let best = null;
+  for (const q of quads) {
+    const sides = quadSideLengths(q.quad);
+    const w = avg(sides.top, sides.bottom);
+    const h = avg(sides.left, sides.right);
+    const ratio = Math.max(w,h) / Math.min(w,h);
+
+    // допускаем погрешность
+    const okRatio = Math.abs(ratio - A4_RATIO) < 0.20; // +-0.20 (можно ужесточить позже)
+    if (!okRatio) continue;
+
+    if (!best || q.area > best.area) best = { ...q, wpx:w, hpx:h, ratio };
   }
-});
+  return best;
+}
 
-async function startCamera() {
-  setStatus('запрашиваю доступ к камере…');
+function pickRug(quads, a4Candidate) {
+  // ковёр чаще всего самый большой прямоугольник, который не является A4
+  let best = null;
+  for (const q of quads) {
+    // если есть A4 — исключим близкое по площади/положению
+    if (a4Candidate) {
+      // грубо: исключаем тот же quad по близкой площади
+      if (Math.abs(q.area - a4Candidate.area) < a4Candidate.area * 0.15) continue;
+    }
+    if (!best || q.area > best.area) best = q;
+  }
+  return best;
+}
 
+async function start() {
+  setStatus('запрашиваю камеру…');
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false
   });
-
   video.srcObject = stream;
   await video.play();
-  setStatus('камера даёт кадры, запускаю распознавание…');
+  setStatus('камера запущена. наведи на ковёр + A4…');
+
+  running = true;
+  btn.textContent = 'Стоп';
+
+  // процессим ~8 раз/сек, чтобы телефон не умирал
+  timer = setInterval(processFrame, 125);
 }
 
-async function loop() {
-  if (!running) return;
-
-  frames++;
-  framesEl.textContent = String(frames);
-
-  // Если по какой-то причине результаты не приходят — покажем подсказку
-  if (Date.now() - lastResultAt > 3000) {
-    setStatus('нет ответа от модели… (обнови страницу и попробуй ещё раз)');
-  }
-
-  try {
-    await hands.send({ image: video });
-  } catch (e) {
-    console.error(e);
-    setStatus('ошибка обработки кадра (см. консоль)');
-  }
-
-  requestAnimationFrame(loop);
-}
-
-function stopAll() {
+function stop() {
   running = false;
-  btn.textContent = 'Запустить камеру';
+  btn.textContent = 'Старт';
   setStatus('остановлено');
 
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
-  }
+  if (timer) { clearInterval(timer); timer = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   video.srcObject = null;
 
-  countEl.textContent = '—';
-  framesEl.textContent = '0';
+  a4El.textContent = '—';
+  rugEl.textContent = '—';
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
 }
 
-btn.addEventListener('click', async () => {
-  if (running) {
-    stopAll();
-    return;
-  }
+function fmtMeters(mm) {
+  return (mm/1000).toFixed(2);
+}
 
+function processFrame() {
+  if (!running) return;
+  if (!video.videoWidth || !video.videoHeight) return;
+
+  // draw raw video to canvas (diagnostic + base)
+  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // read to OpenCV
+  let src = cv.imread(canvas); // RGBA
+  const quads = findQuads(src);
+  src.delete();
+
+  const a4 = pickA4(quads);
+  const rug = pickRug(quads, a4);
+
+  if (!a4) {
+    a4El.textContent = 'не найден';
+    setStatus('не вижу A4 (лист должен быть целиком, без бликов, на полу).');
+  } else {
+    // scale: mm per pixel по двум сторонам A4
+    const sides = quadSideLengths(a4.quad);
+    const wpx = Math.min(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
+    const hpx = Math.max(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
+    const mmPerPxW = A4_W_MM / wpx;
+    const mmPerPxH = A4_H_MM / hpx;
+    const mmPerPx = (mmPerPxW + mmPerPxH) / 2;
+
+    a4El.textContent = `ok (${mmPerPx.toFixed(3)} мм/px)`;
+
+    drawQuad(a4.quad, 'rgba(0,255,153,0.95)', 4);
+    drawLabel('A4', a4.quad[0].x, a4.quad[0].y);
+
+    if (!rug) {
+      rugEl.textContent = 'не найден';
+      setStatus('вижу A4, но не вижу ковёр как прямоугольник. Нужен контраст с полом.');
+      return;
+    }
+
+    const rs = quadSideLengths(rug.quad);
+    const rwpx = avg(rs.top, rs.bottom);
+    const rhpx = avg(rs.left, rs.right);
+    const longPx = Math.max(rwpx, rhpx);
+    const shortPx = Math.min(rwpx, rhpx);
+
+    const longMm = longPx * mmPerPx;
+    const shortMm = shortPx * mmPerPx;
+
+    const areaM2 = (longMm/1000) * (shortMm/1000);
+
+    rugEl.textContent = `${fmtMeters(longMm)}×${fmtMeters(shortMm)} м | ${areaM2.toFixed(2)} м²`;
+
+    drawQuad(rug.quad, 'rgba(255,200,0,0.95)', 5);
+    drawLabel('КОВЁР', rug.quad[0].x, rug.quad[0].y);
+
+    setStatus('готово. если прыгают цифры — держи телефон ровнее и добавь света.');
+  }
+}
+
+// ---- OpenCV ready hook ----
+function waitForOpenCVReady() {
+  if (typeof cv === 'undefined' || !cv.Mat) {
+    setStatus('жду OpenCV…');
+    return setTimeout(waitForOpenCVReady, 100);
+  }
+  if (cv && cv['onRuntimeInitialized']) {
+    cv['onRuntimeInitialized'] = () => setStatus('OpenCV готов. Нажми “Старт”.');
+  } else {
+    setStatus('OpenCV готов. Нажми “Старт”.');
+  }
+}
+waitForOpenCVReady();
+
+// ---- UI ----
+btn.addEventListener('click', async () => {
   try {
-    running = true;
-    btn.textContent = 'Остановить';
-    await startCamera();
-    lastResultAt = Date.now();
-    lastHandSeenAt = 0;
-    requestAnimationFrame(loop);
+    if (!running) await start();
+    else stop();
   } catch (e) {
     console.error(e);
-    running = false;
-    btn.textContent = 'Запустить камеру';
-    setStatus('ошибка запуска камеры: проверь разрешение/HTTPS');
-    alert('Не удалось запустить камеру. Проверь разрешение камеры для сайта и что открыто по HTTPS.');
+    alert('Ошибка запуска. Важно: открыть по HTTPS и разрешить камеру.');
+    stop();
   }
 });
 </script>
-
 </body>
 </html>
