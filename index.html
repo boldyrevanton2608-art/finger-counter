@@ -13,27 +13,34 @@
     #status { padding: 0 14px 12px; opacity:.9; font-size:14px; line-height:1.35; }
     canvas { width: calc(100% - 28px); margin: 0 14px 14px; border-radius:16px; border:1px solid #2b3f63; background:#05070c; min-height:60vh; display:block; }
     #video { position: fixed; left:-10000px; top:0; width: 1px; height: 1px; opacity:0; }
-    .hint { padding:0 14px 14px; opacity:.75; font-size:12px; }
+    .hint { padding:0 14px 14px; opacity:.78; font-size:12px; line-height:1.35; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   </style>
 
-  <!-- OpenCV.js (компьютерное зрение в браузере) -->
+  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 
 <body>
 <header>
-  <div class="pill">A4: <span id="a4">—</span></div>
-  <div class="pill">Ковёр: <span id="rug">—</span></div>
-  <button id="btn">Старт</button>
+  <div class="row">
+    <div class="pill">A4: <span id="a4">—</span></div>
+    <div class="pill">Ковёр: <span id="rug">—</span></div>
+  </div>
+  <div class="row">
+    <button id="btn">Старт</button>
+    <button id="cam">Камера: задняя</button>
+  </div>
 </header>
 
 <div id="status">Статус: жду OpenCV…</div>
 
 <video id="video" playsinline muted></video>
 <canvas id="canvas"></canvas>
+
 <div class="hint">
-  Условия: A4 и ковёр должны быть целиком в кадре, лежать на одной плоскости, света должно быть достаточно.
-  Если ковёр похож по цвету на пол — алгоритму сложно.
+  <b>Важно для A4:</b> положи лист на тёмный фон (или подложи тёмную ткань), без бликов от лампы. Лист должен быть целиком в кадре.
+  <br/>Если хочешь 100% стабильность — обведи A4 чёрным маркером по контуру (один раз) или положи на него тёмную рамку (это резко повышает детект).
 </div>
 
 <script>
@@ -46,6 +53,8 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 const btn = document.getElementById('btn');
+const camBtn = document.getElementById('cam');
+
 const statusEl = document.getElementById('status');
 const a4El = document.getElementById('a4');
 const rugEl = document.getElementById('rug');
@@ -56,12 +65,15 @@ let running = false;
 let stream = null;
 let timer = null;
 
-// ---- helpers ----
+// задняя камера по умолчанию
+let facingMode = 'environment'; // 'user' или 'environment'
+camBtn.textContent = 'Камера: задняя';
+
+// ---------- math/geom helpers ----------
 function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+function avg(a,b){ return (a+b)/2; }
 
 function orderQuad(pts) {
-  // pts: array of 4 {x,y}
-  // return [tl,tr,br,bl]
   const sum = pts.map(p => p.x + p.y);
   const diff = pts.map(p => p.x - p.y);
   const tl = pts[sum.indexOf(Math.min(...sum))];
@@ -80,9 +92,7 @@ function quadSideLengths(quad) {
   return { top,right,bottom,left };
 }
 
-function avg(a,b){ return (a+b)/2; }
-
-function drawQuad(quad, color='rgba(0,255,153,0.9)', lw=4) {
+function drawQuad(quad, color='rgba(0,255,153,0.95)', lw=4) {
   ctx.save();
   ctx.strokeStyle = color;
   ctx.lineWidth = lw;
@@ -99,48 +109,32 @@ function drawQuad(quad, color='rgba(0,255,153,0.9)', lw=4) {
 function drawLabel(text, x, y) {
   ctx.save();
   ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  ctx.fillRect(x, y-24, 260, 28);
+  ctx.fillRect(x, y-24, 310, 28);
   ctx.fillStyle = '#e7eefc';
   ctx.font = '700 16px system-ui,-apple-system,Segoe UI,Roboto,Arial';
   ctx.fillText(text, x+8, y-6);
   ctx.restore();
 }
 
-// ---- OpenCV processing ----
-function findQuads(matRGBA) {
-  // returns list of {quad:[{x,y}...], area:number}
-  let mat = new cv.Mat();
-  cv.cvtColor(matRGBA, mat, cv.COLOR_RGBA2GRAY);
-
-  // slight blur
-  cv.GaussianBlur(mat, mat, new cv.Size(5,5), 0, 0, cv.BORDER_DEFAULT);
-
-  // edges
-  let edges = new cv.Mat();
-  cv.Canny(mat, edges, 60, 160);
-
-  // dilate to close gaps
-  let kernel = cv.Mat.ones(3,3, cv.CV_8U);
-  cv.dilate(edges, edges, kernel);
-
-  // contours
+// ---------- OpenCV core ----------
+function findQuadsFromBinary(binary) {
+  // binary: single-channel 0/255
   let contours = new cv.MatVector();
   let hierarchy = new cv.Mat();
-  cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
   const quads = [];
 
   for (let i=0; i<contours.size(); i++) {
     const cnt = contours.get(i);
     const area = cv.contourArea(cnt);
-    if (area < 3000) { cnt.delete(); continue; } // отсекаем мелочь
+    if (area < 5000) { cnt.delete(); continue; }
 
     const peri = cv.arcLength(cnt, true);
     const approx = new cv.Mat();
     cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
     if (approx.rows === 4 && cv.isContourConvex(approx)) {
-      // extract points
       const pts = [];
       for (let r=0; r<4; r++) {
         const x = approx.intPtr(r,0)[0];
@@ -155,13 +149,44 @@ function findQuads(matRGBA) {
     cnt.delete();
   }
 
-  mat.delete(); edges.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+  contours.delete(); hierarchy.delete();
   return quads;
 }
 
+function buildBinaryEdges(gray) {
+  // edges pipeline: blur -> canny -> dilate
+  let g = new cv.Mat();
+  cv.GaussianBlur(gray, g, new cv.Size(5,5), 0, 0, cv.BORDER_DEFAULT);
+
+  let edges = new cv.Mat();
+  cv.Canny(g, edges, 60, 160);
+
+  let kernel = cv.Mat.ones(3,3, cv.CV_8U);
+  cv.dilate(edges, edges, kernel);
+
+  g.delete(); kernel.delete();
+  return edges; // must delete later
+}
+
+function buildBinaryWhite(gray) {
+  // white sheet pipeline: normalize -> adaptive threshold -> close
+  let g = new cv.Mat();
+  // выравниваем освещение
+  cv.GaussianBlur(gray, g, new cv.Size(7,7), 0);
+
+  let bin = new cv.Mat();
+  // adaptive threshold помогает при неравномерном свете
+  cv.adaptiveThreshold(g, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 5);
+
+  // морфологическое закрытие, чтобы лист был цельным
+  let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7,7));
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel);
+
+  g.delete(); kernel.delete();
+  return bin; // must delete later
+}
+
 function pickA4(quads) {
-  // ищем четырёхугольник с соотношением сторон около 1.414 и разумной площадью
-  // чем больше площадь — тем увереннее (но не слишком огромный)
   let best = null;
   for (const q of quads) {
     const sides = quadSideLengths(q.quad);
@@ -169,43 +194,122 @@ function pickA4(quads) {
     const h = avg(sides.left, sides.right);
     const ratio = Math.max(w,h) / Math.min(w,h);
 
-    // допускаем погрешность
-    const okRatio = Math.abs(ratio - A4_RATIO) < 0.20; // +-0.20 (можно ужесточить позже)
+    // A4 соотношение сторон ~1.414, допускаем погрешность
+    const okRatio = Math.abs(ratio - A4_RATIO) < 0.28; // шире допуск для жизни
     if (!okRatio) continue;
 
+    // A4 не должен быть слишком огромным (если слишком близко к камере)
+    if (q.area < 8000) continue;
+
+    // выбираем самый "уверенный" по площади
     if (!best || q.area > best.area) best = { ...q, wpx:w, hpx:h, ratio };
   }
   return best;
 }
 
 function pickRug(quads, a4Candidate) {
-  // ковёр чаще всего самый большой прямоугольник, который не является A4
   let best = null;
   for (const q of quads) {
-    // если есть A4 — исключим близкое по площади/положению
-    if (a4Candidate) {
-      // грубо: исключаем тот же quad по близкой площади
-      if (Math.abs(q.area - a4Candidate.area) < a4Candidate.area * 0.15) continue;
-    }
+    if (a4Candidate && Math.abs(q.area - a4Candidate.area) < a4Candidate.area * 0.2) continue;
     if (!best || q.area > best.area) best = q;
   }
   return best;
 }
 
+function fmtMeters(mm) { return (mm/1000).toFixed(2); }
+
+function processFrame() {
+  if (!running) return;
+  if (!video.videoWidth || !video.videoHeight) return;
+
+  // рисуем видео
+  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // OpenCV read
+  let rgba = cv.imread(canvas);
+  let gray = new cv.Mat();
+  cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+
+  // 1) пробуем через "белый лист"
+  const binWhite = buildBinaryWhite(gray);
+  const quadsWhite = findQuadsFromBinary(binWhite);
+
+  // 2) пробуем через грани
+  const binEdges = buildBinaryEdges(gray);
+  const quadsEdges = findQuadsFromBinary(binEdges);
+
+  // объединяем кандидаты
+  const quadsAll = [...quadsWhite, ...quadsEdges];
+
+  // cleanup mats
+  rgba.delete(); gray.delete(); binWhite.delete(); binEdges.delete();
+
+  const a4 = pickA4(quadsAll);
+  const rug = pickRug(quadsAll, a4);
+
+  if (!a4) {
+    a4El.textContent = 'не найден';
+    rugEl.textContent = '—';
+    setStatus('Не вижу A4. Попробуй: тёмная подложка под A4 + убрать блики + держать камеру выше/ровнее.');
+    return;
+  }
+
+  // scale (mm per pixel) по двум сторонам A4
+  const sides = quadSideLengths(a4.quad);
+  const wpx = Math.min(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
+  const hpx = Math.max(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
+  const mmPerPxW = A4_W_MM / wpx;
+  const mmPerPxH = A4_H_MM / hpx;
+  const mmPerPx = (mmPerPxW + mmPerPxH) / 2;
+
+  a4El.textContent = `ok (${mmPerPx.toFixed(3)} мм/px)`;
+  drawQuad(a4.quad, 'rgba(0,255,153,0.95)', 4);
+  drawLabel('A4', a4.quad[0].x, a4.quad[0].y);
+
+  if (!rug) {
+    rugEl.textContent = 'не найден';
+    setStatus('Вижу A4, но ковёр не выделился как прямоугольник. Нужен контраст ковра с полом / больше света.');
+    return;
+  }
+
+  const rs = quadSideLengths(rug.quad);
+  const rwpx = avg(rs.top, rs.bottom);
+  const rhpx = avg(rs.left, rs.right);
+  const longPx = Math.max(rwpx, rhpx);
+  const shortPx = Math.min(rwpx, rhpx);
+
+  const longMm = longPx * mmPerPx;
+  const shortMm = shortPx * mmPerPx;
+  const areaM2 = (longMm/1000) * (shortMm/1000);
+
+  rugEl.textContent = `${fmtMeters(longMm)}×${fmtMeters(shortMm)} м | ${areaM2.toFixed(2)} м²`;
+  drawQuad(rug.quad, 'rgba(255,200,0,0.95)', 5);
+  drawLabel('КОВЁР', rug.quad[0].x, rug.quad[0].y);
+
+  setStatus('Готово. Если цифры прыгают — держи телефон ровнее и добавь света.');
+}
+
+// ---------- camera start/stop ----------
 async function start() {
   setStatus('запрашиваю камеру…');
+
   stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+    video: { facingMode, width: { ideal: 1920 }, height: { ideal: 1080 } },
     audio: false
   });
+
   video.srcObject = stream;
   await video.play();
-  setStatus('камера запущена. наведи на ковёр + A4…');
 
   running = true;
   btn.textContent = 'Стоп';
+  setStatus('камера запущена. Наведи на ковёр + A4…');
 
-  // процессим ~8 раз/сек, чтобы телефон не умирал
+  // ~8 fps
   timer = setInterval(processFrame, 125);
 }
 
@@ -215,6 +319,7 @@ function stop() {
   setStatus('остановлено');
 
   if (timer) { clearInterval(timer); timer = null; }
+
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   video.srcObject = null;
 
@@ -224,87 +329,14 @@ function stop() {
   ctx.clearRect(0,0,canvas.width,canvas.height);
 }
 
-function fmtMeters(mm) {
-  return (mm/1000).toFixed(2);
-}
-
-function processFrame() {
-  if (!running) return;
-  if (!video.videoWidth || !video.videoHeight) return;
-
-  // draw raw video to canvas (diagnostic + base)
-  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-  }
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-  // read to OpenCV
-  let src = cv.imread(canvas); // RGBA
-  const quads = findQuads(src);
-  src.delete();
-
-  const a4 = pickA4(quads);
-  const rug = pickRug(quads, a4);
-
-  if (!a4) {
-    a4El.textContent = 'не найден';
-    setStatus('не вижу A4 (лист должен быть целиком, без бликов, на полу).');
-  } else {
-    // scale: mm per pixel по двум сторонам A4
-    const sides = quadSideLengths(a4.quad);
-    const wpx = Math.min(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
-    const hpx = Math.max(avg(sides.top, sides.bottom), avg(sides.left, sides.right));
-    const mmPerPxW = A4_W_MM / wpx;
-    const mmPerPxH = A4_H_MM / hpx;
-    const mmPerPx = (mmPerPxW + mmPerPxH) / 2;
-
-    a4El.textContent = `ok (${mmPerPx.toFixed(3)} мм/px)`;
-
-    drawQuad(a4.quad, 'rgba(0,255,153,0.95)', 4);
-    drawLabel('A4', a4.quad[0].x, a4.quad[0].y);
-
-    if (!rug) {
-      rugEl.textContent = 'не найден';
-      setStatus('вижу A4, но не вижу ковёр как прямоугольник. Нужен контраст с полом.');
-      return;
-    }
-
-    const rs = quadSideLengths(rug.quad);
-    const rwpx = avg(rs.top, rs.bottom);
-    const rhpx = avg(rs.left, rs.right);
-    const longPx = Math.max(rwpx, rhpx);
-    const shortPx = Math.min(rwpx, rhpx);
-
-    const longMm = longPx * mmPerPx;
-    const shortMm = shortPx * mmPerPx;
-
-    const areaM2 = (longMm/1000) * (shortMm/1000);
-
-    rugEl.textContent = `${fmtMeters(longMm)}×${fmtMeters(shortMm)} м | ${areaM2.toFixed(2)} м²`;
-
-    drawQuad(rug.quad, 'rgba(255,200,0,0.95)', 5);
-    drawLabel('КОВЁР', rug.quad[0].x, rug.quad[0].y);
-
-    setStatus('готово. если прыгают цифры — держи телефон ровнее и добавь света.');
-  }
-}
-
-// ---- OpenCV ready hook ----
+// ---------- OpenCV ready hook ----------
 function waitForOpenCVReady() {
-  if (typeof cv === 'undefined' || !cv.Mat) {
-    setStatus('жду OpenCV…');
-    return setTimeout(waitForOpenCVReady, 100);
-  }
-  if (cv && cv['onRuntimeInitialized']) {
-    cv['onRuntimeInitialized'] = () => setStatus('OpenCV готов. Нажми “Старт”.');
-  } else {
-    setStatus('OpenCV готов. Нажми “Старт”.');
-  }
+  if (typeof cv === 'undefined' || !cv.Mat) return setTimeout(waitForOpenCVReady, 100);
+  cv.onRuntimeInitialized = () => setStatus('OpenCV готов. Нажми “Старт”.');
 }
 waitForOpenCVReady();
 
-// ---- UI ----
+// ---------- UI ----------
 btn.addEventListener('click', async () => {
   try {
     if (!running) await start();
@@ -313,6 +345,18 @@ btn.addEventListener('click', async () => {
     console.error(e);
     alert('Ошибка запуска. Важно: открыть по HTTPS и разрешить камеру.');
     stop();
+  }
+});
+
+camBtn.addEventListener('click', async () => {
+  // переключаем камеру
+  facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+  camBtn.textContent = (facingMode === 'environment') ? 'Камера: задняя' : 'Камера: фронтальная';
+
+  // если уже работает — перезапускаем поток
+  if (running) {
+    stop();
+    await start();
   }
 });
 </script>
