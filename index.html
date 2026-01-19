@@ -12,12 +12,15 @@
       background: #0b0f17;
       color: #e7eefc;
     }
+
     header {
       padding: 14px;
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 10px;
     }
+
     button {
       padding: 10px 14px;
       border-radius: 12px;
@@ -26,15 +29,26 @@
       color: white;
       font-weight: 600;
     }
+
+    #status {
+      padding: 0 14px 12px;
+      opacity: 0.85;
+      font-size: 14px;
+    }
+
+    /* Окно камеры — видно сразу */
     canvas {
-      width: 100%;
-      max-width: 900px;
-      display: block;
-      margin: 0 auto;
+      width: calc(100% - 28px);
+      margin: 0 14px 14px;
       border-radius: 16px;
+      border: 1px solid #2b3f63;
+      background: #05070c;
+      min-height: 60vh;
+      display: block;
     }
   </style>
 
+  <!-- MediaPipe -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
@@ -47,6 +61,8 @@
   <button id="btn">Запустить камеру</button>
 </header>
 
+<div id="status">Статус: ожидаю запуск…</div>
+
 <video id="video" playsinline style="display:none"></video>
 <canvas id="canvas"></canvas>
 
@@ -56,6 +72,9 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const countEl = document.getElementById('count');
 const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+
+const setStatus = (t) => statusEl.textContent = 'Статус: ' + t;
 
 let running = false;
 let camera = null;
@@ -72,26 +91,28 @@ hands.setOptions({
 });
 
 hands.onResults(results => {
+  if (!results.image) return;
+
   canvas.width = results.image.width;
   canvas.height = results.image.height;
   ctx.drawImage(results.image, 0, 0);
 
   let fingers = 0;
 
-  if (results.multiHandLandmarks) {
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length) {
     const lm = results.multiHandLandmarks[0];
 
-    // thumb
+    // Большой палец
     if (lm[4].x > lm[3].x) fingers++;
 
-    // other fingers
+    // Остальные пальцы
     if (lm[8].y < lm[6].y) fingers++;
     if (lm[12].y < lm[10].y) fingers++;
     if (lm[16].y < lm[14].y) fingers++;
     if (lm[20].y < lm[18].y) fingers++;
 
-    drawConnectors(ctx, lm, HAND_CONNECTIONS);
-    drawLandmarks(ctx, lm);
+    drawConnectors(ctx, lm, HAND_CONNECTIONS, { color: '#00ff99', lineWidth: 4 });
+    drawLandmarks(ctx, lm, { color: '#ffffff', radius: 3 });
   }
 
   countEl.textContent = fingers;
@@ -100,17 +121,26 @@ hands.onResults(results => {
 btn.onclick = async () => {
   if (running) return;
 
-  camera = new Camera(video, {
-    onFrame: async () => {
-      await hands.send({ image: video });
-    },
-    width: 1280,
-    height: 720
-  });
+  try {
+    setStatus('запрашиваю доступ к камере…');
 
-  await camera.start();
-  running = true;
-  btn.textContent = 'Камера работает';
+    camera = new Camera(video, {
+      onFrame: async () => {
+        await hands.send({ image: video });
+      },
+      width: 1280,
+      height: 720
+    });
+
+    await camera.start();
+    running = true;
+    btn.textContent = 'Камера работает';
+    setStatus('камера запущена, ищу руку…');
+  } catch (e) {
+    console.error(e);
+    setStatus('ОШИБКА: нет доступа к камере');
+    alert('Не удалось запустить камеру.\n\nПроверь:\n1) сайт открыт по HTTPS\n2) разрешение камеры (замочек в адресной строке)');
+  }
 };
 </script>
 
